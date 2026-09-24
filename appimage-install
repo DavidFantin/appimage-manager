@@ -1,0 +1,1282 @@
+#!/bin/bash
+
+# Script version definition
+APPIMAGE_INSTALL_VERSION="1.0.0"
+
+# Enable nullglob so unmatched globs expand to nothing instead of literal strings
+shopt -s nullglob
+
+# Operation flag initializations
+UPGRADE=false
+ROLLBACK=false
+LIST=false
+LIST_ALL=false
+VERSION_QUERY=false
+BACKUPS_QUERY=false
+TRIM_ALL_BACKUPS=false
+CLEAR_BACKUPS=false
+CLEAR_ALL_BACKUPS=false
+
+# Argument variables
+APPIMAGE=""
+LINKNAME=""
+ROLLBACK_VERSION=""
+
+# Standard installation & configuration paths
+APPDIR="$HOME/.local/appimages"
+BACKUPDIR="$APPDIR/backups"
+BINDIR="$HOME/.local/bin"
+CONFIGDIR="$HOME/.config/appimage-install"
+CONFIGFILE="$CONFIGDIR/config"
+STATEFILE="$CONFIGDIR/.last_max_backups"
+UNTRIMMED_STATEFILE="$CONFIGDIR/.untrimmed_state"
+
+# ============================================================
+# HELP DISPLAY
+# ============================================================
+
+show_help() {
+    cat << EOF
+Usage:
+  appimage-install <AppImage> <LinkName>
+  appimage-install -u <AppImage>
+  appimage-install <LinkName> --rollback [Version]
+  appimage-install -u <LinkName> --rollback [Version]
+  appimage-install <LinkName> --version
+  appimage-install -v <LinkName>
+  appimage-install <LinkName> --version-backups
+  appimage-install -vb <LinkName>
+  appimage-install <LinkName> --clear-backups
+  appimage-install -cb <LinkName>
+  appimage-install --clear-all-backups
+  appimage-install -cba
+  appimage-install -l
+  appimage-install -la
+  appimage-install -h
+  appimage-install --version
+
+Commands:
+  <AppImage> <LinkName>        Install or change version
+  -u <AppImage>                Change version with default Yes
+  <LinkName> --rollback        Roll back to a previous version
+  <LinkName> --version         Show the current version
+  -v <LinkName>                Show the current version
+  <LinkName> --version-backups Show retained backup versions
+  -vb <LinkName>                Show retained backup versions
+  <LinkName> --clear-backups   Delete all backups for one AppImage
+  -cb <LinkName>                Delete all backups for one AppImage
+  --clear-all-backups          Delete all backups for every AppImage
+  -cba                          Delete all backups for every AppImage
+  -l, --list                   List installed AppImages
+  -la, --list-all               List installed AppImages and backups
+  -h, --help                   Show this help
+  --version                    Show appimage-install version
+
+Examples:
+  appimage-install RockboxUtility-1.5.1.AppImage rockbox
+  appimage-install -u RockboxUtility-1.5.2-x86_64.AppImage
+  appimage-install rockbox --rollback
+  appimage-install rockbox --rollback 1.5.1
+  appimage-install rockbox --rollback v1.5.1
+  appimage-install -u rockbox --rollback 1.5.1
+  appimage-install rockbox --version
+  appimage-install -v rockbox
+  appimage-install rockbox --version-backups
+  appimage-install -vb rockbox
+  appimage-install rockbox --clear-backups
+  appimage-install -cb rockbox
+  appimage-install --clear-all-backups
+  appimage-install -cba
+  appimage-install -l
+  appimage-install -la
+
+Confirmation:
+  Normal: [y/N]
+  -u:     [Y/n]
+
+Backup setting:
+  $CONFIGFILE
+
+  Default:
+    max_backups=1
+EOF
+}
+
+# Fast exit for single help or version queries
+if [[ $# -eq 1 ]]; then
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+
+        --version)
+            echo "appimage-install $APPIMAGE_INSTALL_VERSION"
+            exit 0
+            ;;
+    esac
+fi
+
+# Detect rollback flag in arguments
+for ARG in "$@"; do
+    if [[ "$ARG" == "--rollback" ]]; then
+        ROLLBACK=true
+        break
+    fi
+done
+
+# Detect version and backup inspection flags
+for ARG in "$@"; do
+    case "$ARG" in
+        -v|--version)
+            VERSION_QUERY=true
+            ;;
+
+        -vb|--version-backups)
+            BACKUPS_QUERY=true
+            ;;
+    esac
+done
+
+# Detect backup deletion flags
+for ARG in "$@"; do
+    case "$ARG" in
+        -cb|--clear-backups)
+            CLEAR_BACKUPS=true
+            ;;
+
+        -cba|--clear-all-backups)
+            CLEAR_ALL_BACKUPS=true
+            ;;
+    esac
+done
+
+# Detect list flags
+for ARG in "$@"; do
+    case "$ARG" in
+        -l|--list)
+            LIST=true
+            ;;
+        -la|--list-all)
+            LIST=true
+            LIST_ALL=true
+            ;;
+    esac
+done
+
+# ============================================================
+# CLI ARGUMENT PARSING & VALIDATION
+# ============================================================
+
+# Validate version/backup/clear flags (must be mutually exclusive)
+if [[ "$VERSION_QUERY" == true || "$BACKUPS_QUERY" == true || "$CLEAR_BACKUPS" == true ]]; then
+
+    FLAG_COUNT=0
+    [[ "$VERSION_QUERY" == true ]] && ((FLAG_COUNT++))
+    [[ "$BACKUPS_QUERY" == true ]] && ((FLAG_COUNT++))
+    [[ "$CLEAR_BACKUPS" == true ]] && ((FLAG_COUNT++))
+
+    if (( FLAG_COUNT > 1 )); then
+        echo "Error: --version, --version-backups, and --clear-backups cannot be combined."
+        exit 1
+    fi
+
+    POSITIONAL=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--version|-vb|--version-backups|-cb|--clear-backups)
+                shift
+                ;;
+            *)
+                POSITIONAL+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#POSITIONAL[@]} -ne 1 ]]; then
+
+        if [[ "$VERSION_QUERY" == true ]]; then
+            echo "Usage: appimage-install [ -v ] <LinkName>"
+        elif [[ "$BACKUPS_QUERY" == true ]]; then
+            echo "Usage: appimage-install [ -vb ] <LinkName>"
+        else
+            echo "Usage: appimage-install [ -cb ] <LinkName>"
+        fi
+
+        echo "Try 'appimage-install --help' for more information."
+        exit 1
+    fi
+
+    LINKNAME="${POSITIONAL[0]}"
+    TARGET="$BINDIR/$LINKNAME"
+
+# Parse --clear-all-backups flag
+elif [[ "$CLEAR_ALL_BACKUPS" == true ]]; then
+
+    for ARG in "$@"; do
+        case "$ARG" in
+            -cba|--clear-all-backups)
+                ;;
+            *)
+                echo "Error: --clear-all-backups cannot be combined with other commands."
+                echo "Try 'appimage-install --help' for more information."
+                exit 1
+                ;;
+        esac
+    done
+
+# Parse --rollback flag and version arguments
+elif [[ "$ROLLBACK" == true ]]; then
+
+    POSITIONAL=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -u)
+                UPGRADE=true
+                shift
+                ;;
+
+            --rollback)
+                shift
+                ;;
+
+            *)
+                POSITIONAL+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#POSITIONAL[@]} -lt 1 || ${#POSITIONAL[@]} -gt 2 ]]; then
+        echo "Usage: appimage-install [ -u ] <LinkName> --rollback [Version]"
+        echo "Try 'appimage-install --help' for more information."
+        exit 1
+    fi
+
+    LINKNAME="${POSITIONAL[0]}"
+
+    # Normalize version string by removing leading 'v' or 'V'
+    if [[ ${#POSITIONAL[@]} -eq 2 ]]; then
+        ROLLBACK_VERSION="${POSITIONAL[1]}"
+        ROLLBACK_VERSION="${ROLLBACK_VERSION#v}"
+        ROLLBACK_VERSION="${ROLLBACK_VERSION#V}"
+    fi
+
+    TARGET="$BINDIR/$LINKNAME"
+
+# Parse listing flags
+elif [[ "$LIST" == true ]]; then
+
+    if [[ "$UPGRADE" == true ]]; then
+        echo "Error: list options cannot be combined with -u."
+        exit 1
+    fi
+
+    for ARG in "$@"; do
+        case "$ARG" in
+            -l|--list|-la|--list-all)
+                ;;
+            *)
+                echo "Error: list options cannot be combined with other commands."
+                echo "Try 'appimage-install --help' for more information."
+                exit 1
+                ;;
+        esac
+    done
+
+# Parse standard install/upgrade positional arguments
+else
+
+    POSITIONAL=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -u)
+                UPGRADE=true
+                shift
+                ;;
+
+            *)
+                POSITIONAL+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "$UPGRADE" == true ]]; then
+
+        if [[ ${#POSITIONAL[@]} -ne 1 ]]; then
+            echo "Usage: appimage-install -u <AppImage>"
+            echo "Try 'appimage-install --help' for more information."
+            exit 1
+        fi
+
+        APPIMAGE="${POSITIONAL[0]}"
+
+    else
+
+        if [[ ${#POSITIONAL[@]} -ne 2 ]]; then
+            echo "Usage: appimage-install <AppImage> <LinkName>"
+            echo "Try 'appimage-install --help' for more information."
+            exit 1
+        fi
+
+        APPIMAGE="${POSITIONAL[0]}"
+        LINKNAME="${POSITIONAL[1]}"
+
+    fi
+fi
+
+# Ensure required directory structure exists
+mkdir -p "$APPDIR"
+mkdir -p "$BACKUPDIR"
+mkdir -p "$BINDIR"
+mkdir -p "$CONFIGDIR"
+
+# ============================================================
+# CONFIGURATION MANAGEMENT
+# ============================================================
+
+# Create default configuration file if missing
+if [[ ! -f "$CONFIGFILE" ]]; then
+    cat > "$CONFIGFILE" << EOF
+max_backups=1
+EOF
+fi
+
+MAX_BACKUPS=1
+
+# Read max_backups setting from config file
+while IFS='=' read -r KEY VALUE; do
+    case "$KEY" in
+        max_backups)
+            if [[ "$VALUE" =~ ^[0-9]+$ ]]; then
+                MAX_BACKUPS="$VALUE"
+            else
+                echo "Error: invalid max_backups value in:"
+                echo "  $CONFIGFILE"
+                exit 1
+            fi
+            ;;
+    esac
+done < "$CONFIGFILE"
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+# Convert semver strings into padded 9-digit integers for easy numerical comparison
+version_to_number() {
+
+    local VERSION="$1"
+    local MAJOR MINOR PATCH
+
+    # Strip pre-release suffix or architecture metadata (e.g., 1.5.0-alpha -> 1.5.0)
+    VERSION="${VERSION%%[-_+]*}"
+
+    IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+    # Keep digits only
+    MAJOR="${MAJOR//[^0-9]/}"
+    MINOR="${MINOR//[^0-9]/}"
+    PATCH="${PATCH//[^0-9]/}"
+
+    # Force base-10 evaluation to handle leading zeroes correctly
+    MAJOR=$(( 10#${MAJOR:-0} ))
+    MINOR=$(( 10#${MINOR:-0} ))
+    PATCH=$(( 10#${PATCH:-0} ))
+
+    printf '%03d%03d%03d\n' "$MAJOR" "$MINOR" "$PATCH"
+}
+
+# Numerical version comparison helpers
+version_gt() {
+    (( 10#$1 > 10#$2 ))
+}
+
+version_eq() {
+    (( 10#$1 == 10#$2 ))
+}
+
+# Regex extraction of application name and version string from filename
+parse_appimage() {
+
+    local FILENAME="$1"
+
+    # Match unversioned backup pattern: AppName-backup-YYYYMMDD-HHMMSS.AppImage
+    if [[ "$FILENAME" =~ ^(.+)-backup-([0-9]{8}-[0-9]{6})\.([Aa]pp[Ii]mage)$ ]]; then
+        PARSED_APPNAME="${BASH_REMATCH[1]}"
+        PARSED_VERSION="unversioned (${BASH_REMATCH[2]})"
+        IS_UNVERSIONED_BACKUP=true
+        return 0
+    fi
+
+    IS_UNVERSIONED_BACKUP=false
+
+    # Standard semver parsing (3 digits: 1.5.2)
+    if [[ "$FILENAME" =~ ^(.+)[-_]v?([0-9]+\.[0-9]+\.[0-9]+)(.*)\.([Aa]pp[Ii]mage)$ ]]; then
+        PARSED_APPNAME="${BASH_REMATCH[1]}"
+        PARSED_VERSION="${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    # Standard semver parsing (2 digits: 1.5)
+    if [[ "$FILENAME" =~ ^(.+)[-_]v?([0-9]+\.[0-9]+)(.*)\.([Aa]pp[Ii]mage)$ ]]; then
+        PARSED_APPNAME="${BASH_REMATCH[1]}"
+        PARSED_VERSION="${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    # Fallback for unversioned AppImages (e.g., AppName.AppImage)
+    if [[ "$FILENAME" =~ ^(.+)\.([Aa]pp[Ii]mage)$ ]]; then
+        PARSED_APPNAME="${BASH_REMATCH[1]}"
+        PARSED_VERSION="unversioned"
+        return 0
+    fi
+
+    return 1
+}
+
+# Resolve relative symlinks into absolute paths
+get_link_target() {
+
+    local LINK="$1"
+    local TARGET_LINK
+
+    TARGET_LINK="$(readlink "$LINK")"
+
+    if [[ "$TARGET_LINK" != /* ]]; then
+        TARGET_LINK="$(dirname "$LINK")/$TARGET_LINK"
+    fi
+
+    realpath -m "$TARGET_LINK"
+}
+
+# ============================================================
+# RETENTION LIMIT CHANGE DETECTION
+# ============================================================
+
+PREVIOUS_MAX_BACKUPS=""
+UNIQUE_APPNAMES=()
+
+# Load previous max_backups state
+if [[ -f "$STATEFILE" ]]; then
+    PREVIOUS_MAX_BACKUPS="$(cat "$STATEFILE")"
+    if [[ ! "$PREVIOUS_MAX_BACKUPS" =~ ^[0-9]+$ ]]; then
+        PREVIOUS_MAX_BACKUPS=""
+    fi
+fi
+
+# Check if user previously declined trimming after a limit reduction
+SKIP_PRUNING=false
+if [[ -f "$UNTRIMMED_STATEFILE" ]]; then
+    SKIP_PRUNING=true
+fi
+
+# Detect if retention limit was reduced and prompt to trim excess backups
+if [[ -n "$PREVIOUS_MAX_BACKUPS" ]] &&
+   (( MAX_BACKUPS < PREVIOUS_MAX_BACKUPS )); then
+
+    TOTAL_EXCESS=0
+    APPNAMES=()
+
+    # Discover managed application names in backup directory
+    for FILE in "$BACKUPDIR"/*.AppImage "$BACKUPDIR"/*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            FILENAME="$(basename "$FILE")"
+            if parse_appimage "$FILENAME"; then
+                APPNAMES+=("$PARSED_APPNAME")
+            fi
+        fi
+    done
+
+    # Deduplicate app names
+    for APPNAME in "${APPNAMES[@]}"; do
+        ALREADY_FOUND=false
+        for EXISTING_APPNAME in "${UNIQUE_APPNAMES[@]}"; do
+            if [[ "$APPNAME" == "$EXISTING_APPNAME" ]]; then
+                ALREADY_FOUND=true
+                break
+            fi
+        done
+
+        if [[ "$ALREADY_FOUND" == false ]]; then
+            UNIQUE_APPNAMES+=("$APPNAME")
+        fi
+    done
+
+    # Calculate total excess backups exceeding new retention limit
+    for APPNAME in "${UNIQUE_APPNAMES[@]}"; do
+        BACKUP_COUNT=0
+        for FILE in "$BACKUPDIR/$APPNAME"-*.AppImage "$BACKUPDIR/$APPNAME"-*.appimage \
+                    "$BACKUPDIR/$APPNAME"_*.AppImage "$BACKUPDIR/$APPNAME"_*.appimage; do
+            if [[ -f "$FILE" ]]; then
+                if parse_appimage "$(basename "$FILE")"; then
+                    ((BACKUP_COUNT++))
+                fi
+            fi
+        done
+
+        if (( BACKUP_COUNT > MAX_BACKUPS )); then
+            ((TOTAL_EXCESS += BACKUP_COUNT - MAX_BACKUPS))
+        fi
+    done
+
+    # Prompt user to trim excess backups across all apps
+    if (( TOTAL_EXCESS > 0 )); then
+        echo
+        echo "Backup retention has decreased:"
+        echo "  Previous: $PREVIOUS_MAX_BACKUPS"
+        echo "  Current:  $MAX_BACKUPS"
+        echo
+        echo "There are $TOTAL_EXCESS backup(s) that exceed the new limit."
+        echo
+        echo "Would you like to trim ALL AppImages to $MAX_BACKUPS backup(s)?"
+        echo
+
+        read -rp "Trim all backups? [y/N] " TRIM_ANSWER
+
+        if [[ "$TRIM_ANSWER" =~ ^[Yy]$ ]]; then
+            TRIM_ALL_BACKUPS=true
+            SKIP_PRUNING=false
+            rm -f "$UNTRIMMED_STATEFILE"
+        else
+            echo
+            echo "Backups were not trimmed."
+            SKIP_PRUNING=true
+            touch "$UNTRIMMED_STATEFILE"
+        fi
+    fi
+fi
+
+# Save current max_backups state
+echo "$MAX_BACKUPS" > "$STATEFILE"
+
+# ============================================================
+# PRUNE BACKUPS ROUTINE
+# ============================================================
+
+# Delete oldest backups exceeding MAX_BACKUPS limit for a specific application
+prune_backups() {
+
+    # Honor user decision if they explicitly declined trimming
+    if [[ "$SKIP_PRUNING" == true ]]; then
+        return 0
+    fi
+
+    local APPNAME="$1"
+    local BACKUPS=()
+    local FILE
+    local FILENAME
+    local MTIME
+    local ENTRY
+    local COUNT=0
+
+    # Collect backup files and modification times
+    for FILE in "$BACKUPDIR/$APPNAME"-*.AppImage "$BACKUPDIR/$APPNAME"-*.appimage \
+                "$BACKUPDIR/$APPNAME"_*.AppImage "$BACKUPDIR/$APPNAME"_*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            FILENAME="$(basename "$FILE")"
+            if parse_appimage "$FILENAME"; then
+                MTIME="$(stat -c '%Y' "$FILE")"
+                BACKUPS+=("$MTIME|$FILE")
+            fi
+        fi
+    done
+
+    # If total backups are within configured cap, nothing to prune
+    if (( ${#BACKUPS[@]} <= MAX_BACKUPS )); then
+        return 0
+    fi
+
+    # Sort backups descending by modification time (newest first)
+    local SORTED
+    SORTED="$(printf '%s\n' "${BACKUPS[@]}" | sort -t'|' -k1,1rn)"
+    BACKUPS=()
+    while IFS= read -r ENTRY; do
+        [[ -n "$ENTRY" ]] && BACKUPS+=("$ENTRY")
+    done <<< "$SORTED"
+
+    # Automatically remove files past retention cutoff
+    for ENTRY in "${BACKUPS[@]}"; do
+        FILE="${ENTRY#*|}"
+        if (( COUNT < MAX_BACKUPS )); then
+            ((COUNT++))
+        else
+            echo "Pruned old backup: $(basename "$FILE")"
+            rm -f "$FILE"
+        fi
+    done
+}
+
+# Run global trim if approved during retention change check
+if [[ "$TRIM_ALL_BACKUPS" == true && ${#UNIQUE_APPNAMES[@]} -gt 0 ]]; then
+    echo
+    echo "Trimming backups for all AppImages..."
+    echo
+    for APPNAME in "${UNIQUE_APPNAMES[@]}"; do
+        prune_backups "$APPNAME"
+    done
+    echo
+    echo "Backup trimming complete."
+    echo
+fi
+
+# ============================================================
+# VERSION QUERY COMMAND (-v / --version)
+# ============================================================
+
+if [[ "$VERSION_QUERY" == true ]]; then
+
+    if [[ ! -L "$TARGET" ]]; then
+        echo "Error: command link does not exist:"
+        echo "  $TARGET"
+        exit 1
+    fi
+
+    TARGET_LINK="$(get_link_target "$TARGET")"
+
+    if [[ "$TARGET_LINK" != "$APPDIR/"* || "$TARGET_LINK" == "$BACKUPDIR/"* ]]; then
+        echo "Error: $LINKNAME does not point to an active AppImage managed by appimage-install."
+        exit 1
+    fi
+
+    CURRENT_FILENAME="$(basename "$TARGET_LINK")"
+
+    if ! parse_appimage "$CURRENT_FILENAME"; then
+        echo "Error: could not determine version from:"
+        echo "  $CURRENT_FILENAME"
+        exit 1
+    fi
+
+    echo "$PARSED_VERSION"
+    exit 0
+fi
+
+# ============================================================
+# BACKUPS QUERY COMMAND (-vb / --version-backups)
+# ============================================================
+
+if [[ "$BACKUPS_QUERY" == true ]]; then
+
+    if [[ ! -L "$TARGET" ]]; then
+        echo "Error: command link does not exist:"
+        echo "  $TARGET"
+        exit 1
+    fi
+
+    TARGET_LINK="$(get_link_target "$TARGET")"
+
+    if [[ "$TARGET_LINK" != "$APPDIR/"* || "$TARGET_LINK" == "$BACKUPDIR/"* ]]; then
+        echo "Error: $LINKNAME does not point to an active AppImage managed by appimage-install."
+        exit 1
+    fi
+
+    CURRENT_FILENAME="$(basename "$TARGET_LINK")"
+
+    if ! parse_appimage "$CURRENT_FILENAME"; then
+        echo "Error: could not determine application name from:"
+        echo "  $CURRENT_FILENAME"
+        exit 1
+    fi
+
+    APPNAME="$PARSED_APPNAME"
+    FOUND=false
+
+    echo
+    echo "Backups for $LINKNAME:"
+    echo
+
+    for FILE in "$BACKUPDIR/$APPNAME"-*.AppImage "$BACKUPDIR/$APPNAME"-*.appimage \
+                "$BACKUPDIR/$APPNAME"_*.AppImage "$BACKUPDIR/$APPNAME"_*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            FILENAME="$(basename "$FILE")"
+            if parse_appimage "$FILENAME"; then
+                echo "  $PARSED_VERSION"
+                FOUND=true
+            fi
+        fi
+    done
+
+    if [[ "$FOUND" == false ]]; then
+        echo "  No backups available."
+    fi
+
+    echo
+    exit 0
+fi
+
+# ============================================================
+# CLEAR BACKUPS COMMAND (-cb / --clear-backups)
+# ============================================================
+
+if [[ "$CLEAR_BACKUPS" == true ]]; then
+
+    if [[ ! -L "$TARGET" ]]; then
+        echo "Error: command link does not exist:"
+        echo "  $TARGET"
+        exit 1
+    fi
+
+    TARGET_LINK="$(get_link_target "$TARGET")"
+
+    if [[ "$TARGET_LINK" != "$APPDIR/"* || "$TARGET_LINK" == "$BACKUPDIR/"* ]]; then
+        echo "Error: $LINKNAME does not point to an active AppImage managed by appimage-install."
+        exit 1
+    fi
+
+    CURRENT_FILENAME="$(basename "$TARGET_LINK")"
+
+    if ! parse_appimage "$CURRENT_FILENAME"; then
+        echo "Error: could not determine application name from:"
+        echo "  $CURRENT_FILENAME"
+        exit 1
+    fi
+
+    APPNAME="$PARSED_APPNAME"
+    CLEAR_FILES=()
+
+    for FILE in "$BACKUPDIR/$APPNAME"-*.AppImage "$BACKUPDIR/$APPNAME"-*.appimage \
+                "$BACKUPDIR/$APPNAME"_*.AppImage "$BACKUPDIR/$APPNAME"_*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            if parse_appimage "$(basename "$FILE")"; then
+                CLEAR_FILES+=("$FILE")
+            fi
+        fi
+    done
+
+    if [[ ${#CLEAR_FILES[@]} -eq 0 ]]; then
+        echo "No backups to remove for $LINKNAME."
+        exit 0
+    fi
+
+    echo
+    echo "Backups for $LINKNAME:"
+    echo
+
+    for FILE in "${CLEAR_FILES[@]}"; do
+        echo "  $(basename "$FILE")"
+    done
+
+    echo
+    read -rp "Remove all ${#CLEAR_FILES[@]} backup(s) for $LINKNAME? [y/N] " ANSWER
+
+    if [[ ! "$ANSWER" =~ ^[Yy]$ ]]; then
+        echo "Operation cancelled."
+        exit 0
+    fi
+
+    echo
+    for FILE in "${CLEAR_FILES[@]}"; do
+        echo "Removing: $(basename "$FILE")"
+        rm -f "$FILE"
+    done
+
+    rm -f "$UNTRIMMED_STATEFILE"
+
+    echo
+    echo "All backups removed for $LINKNAME."
+    exit 0
+fi
+
+# ============================================================
+# CLEAR ALL BACKUPS COMMAND (-cba / --clear-all-backups)
+# ============================================================
+
+if [[ "$CLEAR_ALL_BACKUPS" == true ]]; then
+
+    CLEAR_FILES=()
+
+    for FILE in "$BACKUPDIR"/*.AppImage "$BACKUPDIR"/*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            if parse_appimage "$(basename "$FILE")"; then
+                CLEAR_FILES+=("$FILE")
+            fi
+        fi
+    done
+
+    if [[ ${#CLEAR_FILES[@]} -eq 0 ]]; then
+        echo "No backups to remove."
+        exit 0
+    fi
+
+    echo
+    echo "All backups:"
+    echo
+
+    for FILE in "${CLEAR_FILES[@]}"; do
+        echo "  $(basename "$FILE")"
+    done
+
+    echo
+    read -rp "Remove all ${#CLEAR_FILES[@]} backup(s) across every AppImage? [y/N] " ANSWER
+
+    if [[ ! "$ANSWER" =~ ^[Yy]$ ]]; then
+        echo "Operation cancelled."
+        exit 0
+    fi
+
+    echo
+    for FILE in "${CLEAR_FILES[@]}"; do
+        echo "Removing: $(basename "$FILE")"
+        rm -f "$FILE"
+    done
+
+    rm -f "$UNTRIMMED_STATEFILE"
+
+    echo
+    echo "All backups removed."
+    exit 0
+fi
+
+# ============================================================
+# LIST COMMAND (-l / -la)
+# ============================================================
+
+if [[ "$LIST" == true ]]; then
+
+    FOUND=false
+
+    if [[ "$LIST_ALL" == true ]]; then
+        echo
+        echo "All AppImages:"
+    else
+        echo
+        echo "Installed AppImages:"
+    fi
+
+    echo
+    printf "%-25s %-32s %-10s %-20s\n" \
+        "Application" "Version" "Status" "Command"
+
+    printf "%-25s %-32s %-10s %-20s\n" \
+        "-------------------------" "--------------------------------" "----------" "--------------------"
+
+    # Display active applications in $APPDIR
+    for FILE in "$APPDIR"/*.AppImage "$APPDIR"/*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            FILENAME="$(basename "$FILE")"
+            if parse_appimage "$FILENAME"; then
+                APPNAME="$PARSED_APPNAME"
+                VERSION="$PARSED_VERSION"
+                COMMAND="-"
+                FILE_PATH="$(realpath -m "$FILE")"
+
+                # Find matching command link in $BINDIR
+                for LINK in "$BINDIR"/*; do
+                    if [[ -L "$LINK" ]]; then
+                        TARGET_LINK="$(get_link_target "$LINK")"
+                        if [[ "$TARGET_LINK" == "$FILE_PATH" ]]; then
+                            COMMAND="$(basename "$LINK")"
+                            break
+                        fi
+                    fi
+                done
+
+                printf "%-25s %-32s %-10s %-20s\n" \
+                    "$APPNAME" "$VERSION" "current" "$COMMAND"
+                FOUND=true
+            fi
+        fi
+    done
+
+    # Include backup versions when -la is specified
+    if [[ "$LIST_ALL" == true ]]; then
+        for FILE in "$BACKUPDIR"/*.AppImage "$BACKUPDIR"/*.appimage; do
+            if [[ -f "$FILE" ]]; then
+                FILENAME="$(basename "$FILE")"
+                if parse_appimage "$FILENAME"; then
+                    APPNAME="$PARSED_APPNAME"
+                    VERSION="$PARSED_VERSION"
+                    printf "%-25s %-32s %-10s %-20s\n" \
+                        "$APPNAME" "$VERSION" "backup" "-"
+                    FOUND=true
+                fi
+            fi
+        done
+    fi
+
+    echo
+    if [[ "$FOUND" == false ]]; then
+        echo "No AppImages installed."
+    fi
+
+    exit 0
+fi
+
+# ============================================================
+# ROLLBACK COMMAND (--rollback)
+# ============================================================
+
+if [[ "$ROLLBACK" == true ]]; then
+
+    if [[ ! -L "$TARGET" ]]; then
+        echo "Error: command link does not exist:"
+        echo "  $TARGET"
+        exit 1
+    fi
+
+    TARGET_LINK="$(get_link_target "$TARGET")"
+
+    if [[ "$TARGET_LINK" != "$APPDIR/"* ]]; then
+        echo "Error: $LINKNAME does not point to an AppImage managed by appimage-install."
+        exit 1
+    fi
+
+    if [[ "$TARGET_LINK" == "$BACKUPDIR/"* ]]; then
+        echo "Error: $LINKNAME points to a backup, not an active AppImage."
+        exit 1
+    fi
+
+    CURRENT_FILE="$TARGET_LINK"
+    CURRENT_FILENAME="$(basename "$CURRENT_FILE")"
+
+    if [[ ! -f "$CURRENT_FILE" ]]; then
+        echo "Error: current AppImage does not exist:"
+        echo "  $CURRENT_FILE"
+        exit 1
+    fi
+
+    if ! parse_appimage "$CURRENT_FILENAME"; then
+        echo "Error: could not determine application and version from:"
+        echo "  $CURRENT_FILENAME"
+        exit 1
+    fi
+
+    APPNAME="$PARSED_APPNAME"
+    CURRENT_VERSION="$PARSED_VERSION"
+    ROLLBACK_CANDIDATES=()
+
+    # Find candidate backup versions in $BACKUPDIR
+    for FILE in "$BACKUPDIR/$APPNAME"-*.AppImage "$BACKUPDIR/$APPNAME"-*.appimage \
+                "$BACKUPDIR/$APPNAME"_*.AppImage "$BACKUPDIR/$APPNAME"_*.appimage; do
+        if [[ -f "$FILE" ]]; then
+            FILENAME="$(basename "$FILE")"
+            if parse_appimage "$FILENAME"; then
+                VERSION="$PARSED_VERSION"
+                if [[ -z "$ROLLBACK_VERSION" || "$VERSION" == "$ROLLBACK_VERSION" ]]; then
+                    MTIME="$(stat -c '%Y' "$FILE")"
+                    ROLLBACK_CANDIDATES+=("$MTIME|$VERSION|$FILE")
+                fi
+            fi
+        fi
+    done
+
+    BACKUP_FILE=""
+
+    # Select candidate with latest modification time if no explicit version was specified
+    if [[ ${#ROLLBACK_CANDIDATES[@]} -gt 0 ]]; then
+        BEST="$(printf '%s\n' "${ROLLBACK_CANDIDATES[@]}" | sort -t'|' -k1,1rn | head -n1)"
+        BACKUP_VERSION="${BEST#*|}"
+        BACKUP_VERSION="${BACKUP_VERSION%%|*}"
+        BACKUP_FILE="${BEST##*|}"
+    fi
+
+    if [[ -z "$BACKUP_FILE" ]]; then
+        if [[ -n "$ROLLBACK_VERSION" ]]; then
+            echo "Error: version $ROLLBACK_VERSION is not available for $LINKNAME."
+        else
+            echo "Error: no previous version is available for $LINKNAME."
+        fi
+        exit 1
+    fi
+
+    BACKUP_FILENAME="$(basename "$BACKUP_FILE")"
+
+    # Prepare destination filenames
+    if [[ "$CURRENT_VERSION" == "unversioned"* || "$BACKUP_VERSION" == "unversioned"* ]]; then
+        # Active file in $APPDIR must always be clean (e.g., theWeb-linux.AppImage)
+        EXT="${CURRENT_FILENAME##*.}"
+        DEST_ACTIVE_FILENAME="${APPNAME}.${EXT}"
+
+        # Current active file moving to $BACKUPDIR gets a fresh timestamp
+        TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+        DEST_BACKUP_FILENAME="${APPNAME}-backup-${TIMESTAMP}.${EXT}"
+    else
+        DEST_ACTIVE_FILENAME="$BACKUP_FILENAME"
+        DEST_BACKUP_FILENAME="$CURRENT_FILENAME"
+    fi
+
+    echo
+    echo "Application: $APPNAME"
+    echo "Command:     $LINKNAME"
+    echo "Current:     $CURRENT_VERSION"
+    echo "Rollback:    $BACKUP_VERSION"
+    echo
+
+    if [[ "$UPGRADE" == true ]]; then
+        read -rp "Roll back to $BACKUP_VERSION? [Y/n] " ANSWER
+        if [[ -n "$ANSWER" && ! "$ANSWER" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            exit 0
+        fi
+    else
+        read -rp "Roll back to $BACKUP_VERSION? [y/N] " ANSWER
+        if [[ ! "$ANSWER" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            exit 0
+        fi
+    fi
+
+    TEMP_FILE="$APPDIR/.appimage-rollback-temp-$$.AppImage"
+
+    # Trap unexpected signals during file swap to prevent data loss
+    cleanup_rollback() {
+        if [[ -f "$TEMP_FILE" && ! -f "$CURRENT_FILE" ]]; then
+            mv "$TEMP_FILE" "$CURRENT_FILE" 2>/dev/null
+        fi
+    }
+    trap cleanup_rollback EXIT INT TERM
+
+    # Atomic 3-way move sequence
+    mv "$CURRENT_FILE" "$TEMP_FILE" || {
+        echo "Error: could not move current AppImage."
+        exit 1
+    }
+
+    mv "$BACKUP_FILE" "$APPDIR/$DEST_ACTIVE_FILENAME" || {
+        echo "Error: could not activate rollback version."
+        mv "$TEMP_FILE" "$CURRENT_FILE"
+        exit 1
+    }
+
+    mv "$TEMP_FILE" "$BACKUPDIR/$DEST_BACKUP_FILENAME" || {
+        echo "Error: could not save current version as backup."
+        rm -f "$APPDIR/$DEST_ACTIVE_FILENAME"
+        mv "$BACKUP_FILE" "$BACKUPDIR/$BACKUP_FILENAME"
+        mv "$TEMP_FILE" "$CURRENT_FILE"
+        exit 1
+    }
+
+    # Clear recovery trap after successful moves
+    trap - EXIT INT TERM
+
+    touch "$BACKUPDIR/$DEST_BACKUP_FILENAME"
+    ln -sf "$APPDIR/$DEST_ACTIVE_FILENAME" "$TARGET"
+    chmod +x "$APPDIR/$DEST_ACTIVE_FILENAME"
+
+    prune_backups "$APPNAME"
+
+    echo
+    echo "Rollback complete."
+    echo "Active:   $APPDIR/$DEST_ACTIVE_FILENAME"
+    echo "Backup:   $BACKUPDIR/$DEST_BACKUP_FILENAME"
+    echo "Link:     $TARGET"
+
+    exit 0
+fi
+
+# ============================================================
+# NORMAL UPGRADE / DOWNGRADE / REPLACEMENT
+# ============================================================
+
+if [[ ! -f "$APPIMAGE" ]]; then
+    echo "Error: file does not exist: $APPIMAGE"
+    exit 1
+fi
+
+if [[ "$APPIMAGE" != *.AppImage && "$APPIMAGE" != *.appimage ]]; then
+    echo "Error: the file is not an AppImage."
+    exit 1
+fi
+
+FILENAME="$(basename "$APPIMAGE")"
+
+if ! parse_appimage "$FILENAME"; then
+    echo "Error: could not determine application name and version from:"
+    echo "  $FILENAME"
+    exit 1
+fi
+
+APPNAME="$PARSED_APPNAME"
+NEW_VERSION="$PARSED_VERSION"
+NEW_NUMBER="$(version_to_number "$NEW_VERSION")"
+
+EXISTING=()
+
+# Check for versioned files matching APPNAME
+for FILE in "$APPDIR/$APPNAME"-*.AppImage "$APPDIR/$APPNAME"-*.appimage \
+            "$APPDIR/$APPNAME"_*.AppImage "$APPDIR/$APPNAME"_*.appimage; do
+    if [[ -f "$FILE" ]]; then
+        EXISTING+=("$FILE")
+    fi
+done
+
+# Check for exact unversioned file match
+if [[ -f "$APPDIR/$FILENAME" ]]; then
+    EXISTING+=("$APPDIR/$FILENAME")
+fi
+
+if [[ ${#EXISTING[@]} -ne 0 ]]; then
+
+    OLD_FILE="${EXISTING[0]}"
+    OLD_FILENAME="$(basename "$OLD_FILE")"
+
+    if ! parse_appimage "$OLD_FILENAME"; then
+        echo "Error: could not determine installed version from:"
+        echo "  $OLD_FILENAME"
+        exit 1
+    fi
+
+    OLD_VERSION="$PARSED_VERSION"
+    OLD_NUMBER="$(version_to_number "$OLD_VERSION")"
+
+    # Determine exact change type using numerical version comparison
+    if version_eq "$NEW_NUMBER" "$OLD_NUMBER"; then
+        # Bypass exit check for unversioned files to allow updates
+        if [[ "$FILENAME" == "$OLD_FILENAME" && "$OLD_VERSION" != "unversioned"* ]]; then
+            echo "Version $NEW_VERSION is already installed."
+            exit 1
+        fi
+        ACTION="replace"
+    elif version_gt "$NEW_NUMBER" "$OLD_NUMBER"; then
+        ACTION="upgrade"
+    else
+        ACTION="downgrade"
+    fi
+
+    # Force single-backup retention limit for unversioned AppImages
+    if [[ "$OLD_VERSION" == "unversioned"* || "$NEW_VERSION" == "unversioned"* ]]; then
+        ACTION="replace"
+        
+        # Generate a timestamped backup name to prevent file collisions in $BACKUPDIR
+        TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+        OLD_BACKUP_NAME="${PARSED_APPNAME}-backup-${TIMESTAMP}.AppImage"
+    else
+        OLD_BACKUP_NAME="$OLD_FILENAME"
+    fi
+
+    echo
+    echo "Application: $APPNAME"
+    if [[ "$ACTION" == "replace" ]]; then
+        echo "Installed:   $OLD_VERSION ($OLD_FILENAME)"
+        echo "New:         $NEW_VERSION ($FILENAME)"
+    else
+        echo "Installed:   $OLD_VERSION"
+        echo "New:         $NEW_VERSION"
+    fi
+    echo "Action:      $ACTION"
+    echo
+
+    OLD_PATH="$(realpath -m "$OLD_FILE")"
+    TARGET=""
+
+    # Locate the existing command symlink in $BINDIR
+    for LINK in "$BINDIR"/*; do
+        if [[ -L "$LINK" ]]; then
+            TARGET_LINK="$(get_link_target "$LINK")"
+            if [[ "$TARGET_LINK" == "$OLD_PATH" ]]; then
+                TARGET="$LINK"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$TARGET" ]]; then
+        echo "Error: could not find the command link for $APPNAME."
+        exit 1
+    fi
+
+    if [[ "$ACTION" == "upgrade" ]]; then
+        PROMPT_VERB="Upgrade"
+    elif [[ "$ACTION" == "downgrade" ]]; then
+        PROMPT_VERB="Downgrade"
+    else
+        PROMPT_VERB="Replace"
+    fi
+
+    # Confirmation prompt handling (-u defaults to Yes)
+    if [[ "$UPGRADE" == false ]]; then
+        read -rp "$PROMPT_VERB from $OLD_VERSION to $NEW_VERSION? [y/N] " ANSWER
+        if [[ ! "$ANSWER" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            exit 0
+        fi
+    else
+        read -rp "$PROMPT_VERB from $OLD_VERSION to $NEW_VERSION? [Y/n] " ANSWER
+        if [[ -n "$ANSWER" && ! "$ANSWER" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            exit 0
+        fi
+    fi
+
+    # Skip target existence check if replacing an unversioned file with the same name
+    if [[ -e "$APPDIR/$FILENAME" && "$OLD_VERSION" != "unversioned"* ]]; then
+        echo "Error: target AppImage already exists:"
+        echo "  $APPDIR/$FILENAME"
+        exit 1
+    fi
+
+    # Move active version to backup directory with its assigned backup name
+    mv "$OLD_FILE" "$BACKUPDIR/$OLD_BACKUP_NAME" || {
+        echo "Error: could not create backup of $OLD_FILENAME."
+        exit 1
+    }
+
+    touch "$BACKUPDIR/$OLD_BACKUP_NAME"
+    echo "Backed up: $OLD_BACKUP_NAME"
+
+    # Move new version into application directory (overwriting target location safely)
+    mv "$APPIMAGE" "$APPDIR/$FILENAME" || {
+        echo "Error: could not move new AppImage."
+        mv "$BACKUPDIR/$OLD_BACKUP_NAME" "$OLD_FILE"
+        exit 1
+    }
+
+    chmod +x "$APPDIR/$FILENAME"
+    ln -sf "$APPDIR/$FILENAME" "$TARGET"
+
+    prune_backups "$APPNAME"
+
+    echo
+    echo "$ACTION complete."
+    echo "AppImage: $APPDIR/$FILENAME"
+    echo "Backup:   $BACKUPDIR/$OLD_BACKUP_NAME"
+    echo "Link:     $TARGET"
+
+    exit 0
+fi
+
+# ============================================================
+# NEW INSTALLATION
+# ============================================================
+
+if [[ -e "$APPDIR/$FILENAME" ]]; then
+    echo "Error: AppImage already exists:"
+    echo "  $APPDIR/$FILENAME"
+    exit 1
+fi
+
+if [[ "$UPGRADE" == true ]]; then
+    echo "Error: no existing installation of \"$APPNAME\" was found to upgrade."
+    echo "Use: appimage-install <AppImage> <LinkName>"
+    echo "Try 'appimage-install --help' for more information."
+    exit 1
+fi
+
+TARGET="$BINDIR/$LINKNAME"
+
+if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+    echo "Error: link already exists:"
+    echo "  $TARGET"
+    exit 1
+fi
+
+# Install new AppImage and set up binary symlink
+mv "$APPIMAGE" "$APPDIR/$FILENAME" || {
+    echo "Error: could not move AppImage."
+    exit 1
+}
+
+chmod +x "$APPDIR/$FILENAME"
+ln -sf "$APPDIR/$FILENAME" "$TARGET"
+
+echo
+echo "Installed:"
+echo "  $APPDIR/$FILENAME"
+echo
+echo "Created link:"
+echo "  $TARGET"
