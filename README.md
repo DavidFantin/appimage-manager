@@ -36,6 +36,21 @@ export PATH="$HOME/.local/bin:$PATH"
 appimage-install --help
 ```
 
+## Configuration
+By default, 'appimage-manager' operates zero-config using standard XDG based directories:
+- **AppImage Storage:** `~/.local/appimages/` (or `$XDG_DATA_HOME/appimages`)
+- **Binary Symlinks:** `~/.local/bin`
+- **AppImage Backup Version Storage:** `~/.local/appimages/backups`
+
+## Optional Config File
+If present, user overrides and custom paths are loaded from:
+
+```bash
+~/.config/appimage-install/config
+```
+
+NOTE: Currently the only supported option is `MAX_BACKUPS` where you can specify the amount of previous versions you want stored as backups
+
 ## Usage
 
 ```bash
