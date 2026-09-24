@@ -59,9 +59,10 @@ You can now launch it from anywhere with:
 myapp
 ```
 
-## Planned Future Features
+## Planned Features
 
 - [ ] Desktop integration: generate `.desktop` entries for app menu/launcher support.
 - [ ] Uninstall command (e.g., `appimage-install --remove <app-name>`).
 - [ ] Fetch and install AppImages directly from GitHub Releases or URLs.
 - [ ] List mode (`appimage-install --list`) to show installed AppImages and symlinks.
+- [ ] Change the name of the program to better reflect what it does
